@@ -13,9 +13,7 @@ from config import (
     FRACTIONAL_SHARES,
     INITIAL_BALANCE,
     MAX_OPEN_POSITIONS,
-    MAX_POSITION_PCT,
-    RISK_PER_TRADE_PCT,
-    RISK_SCALE_TIERS,
+    POSITION_SIZE_TIERS,
     TRAILING_STOP_ATR_MULT,
     TRAILING_STOP_ENABLED,
 )
@@ -66,18 +64,19 @@ class PaperTrader:
         self.history: list[TradeRecord] = []
         self.peak_equity: float = initial_balance
 
-    # ── Dynamic risk based on equity tier ───────────────────────
+    # ── Position sizing by equity tier ────────────────────────────
 
-    def _current_risk_pct(self) -> float:
+    def _current_position_pct(self) -> float:
+        """Get current tier's position size as % of balance."""
         if not COMPOUND_ENABLED:
-            return RISK_PER_TRADE_PCT
+            return POSITION_SIZE_TIERS[0][1]
         equity = self._equity_estimate()
         multiple = equity / self.initial_balance
-        risk = RISK_PER_TRADE_PCT
-        for tier_mult, tier_risk in RISK_SCALE_TIERS:
+        pct = POSITION_SIZE_TIERS[0][1]
+        for tier_mult, tier_pct in POSITION_SIZE_TIERS:
             if multiple >= tier_mult:
-                risk = tier_risk
-        return risk
+                pct = tier_pct
+        return pct
 
     def _equity_estimate(self) -> float:
         """Quick equity estimate using entry prices (no live quote needed)."""
@@ -90,17 +89,10 @@ class PaperTrader:
     # ── Position sizing ─────────────────────────────────────────
 
     def _calc_shares(self, entry_price: float, stop_loss: float) -> float:
-        risk_pct = self._current_risk_pct()
-        risk_amount = self.balance * risk_pct / 100.0
-        risk_per_share = abs(entry_price - stop_loss)
-        if risk_per_share <= 0:
-            return 0.0
-        shares = risk_amount / risk_per_share
-        # Cap position cost at MAX_POSITION_PCT of balance
-        max_cost = self.balance * MAX_POSITION_PCT / 100.0
-        cost = shares * entry_price
-        if cost > max_cost:
-            shares = max_cost / entry_price
+        pct = self._current_position_pct()
+        # Размер позиции = процент от баланса
+        position_budget = self.balance * pct / 100.0
+        shares = position_budget / entry_price
         if not FRACTIONAL_SHARES:
             shares = int(shares)
         return round(shares, 6)
@@ -131,7 +123,7 @@ class PaperTrader:
             return None
 
         self.balance -= cost
-        risk_pct = self._current_risk_pct()
+        pos_pct = self._current_position_pct()
 
         pos = Position(
             symbol=sig.symbol,
@@ -147,9 +139,9 @@ class PaperTrader:
 
         print(f"\n{'='*60}")
         print(f"  NEW {sig.direction.upper()} — {sig.symbol}")
-        print(f"  Entry: ${sig.entry_price:.2f}  |  Shares: {shares:.4f}")
+        print(f"  Entry: ${sig.entry_price:.2f}  |  Shares: {shares:.4f}  |  Cost: ${cost:.2f}")
         print(f"  SL: ${sig.stop_loss:.2f}  |  TP1: ${sig.take_profit_1:.2f}  |  TP2: ${sig.take_profit_2:.2f}")
-        print(f"  Risk:Reward = 1:{sig.risk_reward:.2f}  |  Risk: {risk_pct:.1f}%")
+        print(f"  R:R = 1:{sig.risk_reward:.2f}  |  Position: {pos_pct:.0f}% of balance")
         print(f"  Time: {sig.signal_time}")
         print(f"{'='*60}\n")
         return pos
@@ -297,13 +289,13 @@ class PaperTrader:
         self.peak_equity = max(self.peak_equity, equity)
         drawdown = (self.peak_equity - equity) / self.peak_equity * 100 if self.peak_equity > 0 else 0
         growth = (equity - self.initial_balance) / self.initial_balance * 100
-        risk_pct = self._current_risk_pct()
+        pos_pct = self._current_position_pct()
 
         print(f"\n{'─'*60}")
         print(f"  PORTFOLIO STATUS")
         print(f"  Cash: ${self.balance:,.2f}  |  Equity: ${equity:,.2f}")
         print(f"  Growth: {growth:+.1f}%  |  Drawdown: {drawdown:.1f}%")
-        print(f"  Risk Tier: {risk_pct:.1f}% per trade")
+        print(f"  Position Size: {pos_pct:.0f}% of balance per trade")
         print(f"  Open Positions: {len(open_positions)}")
 
         for p in open_positions:
