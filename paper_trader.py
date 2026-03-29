@@ -1,18 +1,22 @@
 """
-Paper trading engine — position management, sizing, P&L tracking.
+Paper trading engine — aggressive compounding for small accounts.
 """
 
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime
 
 from config import (
+    COMPOUND_ENABLED,
     FRACTIONAL_SHARES,
     INITIAL_BALANCE,
     MAX_OPEN_POSITIONS,
     RISK_PER_TRADE_PCT,
+    RISK_SCALE_TIERS,
+    TRAILING_STOP_ATR_MULT,
+    TRAILING_STOP_ENABLED,
 )
 from strategy import Signal
 
@@ -32,6 +36,8 @@ class Position:
     status: str = "open"
     partial_tp_hit: bool = False
     original_shares: float = 0.0
+    highest_since_tp1: float = 0.0   # For trailing stop (longs)
+    lowest_since_tp1: float = 999999.0  # For trailing stop (shorts)
 
     def __post_init__(self):
         if self.original_shares == 0.0:
@@ -53,21 +59,45 @@ class TradeRecord:
 
 class PaperTrader:
     def __init__(self, initial_balance: float = INITIAL_BALANCE):
+        self.initial_balance: float = initial_balance
         self.balance: float = initial_balance
         self.positions: list[Position] = []
         self.history: list[TradeRecord] = []
+        self.peak_equity: float = initial_balance
+
+    # ── Dynamic risk based on equity tier ───────────────────────
+
+    def _current_risk_pct(self) -> float:
+        if not COMPOUND_ENABLED:
+            return RISK_PER_TRADE_PCT
+        equity = self._equity_estimate()
+        multiple = equity / self.initial_balance
+        risk = RISK_PER_TRADE_PCT
+        for tier_mult, tier_risk in RISK_SCALE_TIERS:
+            if multiple >= tier_mult:
+                risk = tier_risk
+        return risk
+
+    def _equity_estimate(self) -> float:
+        """Quick equity estimate using entry prices (no live quote needed)."""
+        held_value = sum(
+            p.shares * p.entry_price
+            for p in self.positions if p.status == "open" and p.shares > 0
+        )
+        return self.balance + held_value
 
     # ── Position sizing ─────────────────────────────────────────
 
     def _calc_shares(self, entry_price: float, stop_loss: float) -> float:
-        risk_amount = self.balance * RISK_PER_TRADE_PCT / 100.0
+        risk_pct = self._current_risk_pct()
+        risk_amount = self.balance * risk_pct / 100.0
         risk_per_share = abs(entry_price - stop_loss)
         if risk_per_share <= 0:
             return 0.0
         shares = risk_amount / risk_per_share
         cost = shares * entry_price
-        if cost > self.balance:
-            shares = self.balance / entry_price
+        if cost > self.balance * 0.999:  # Leave tiny buffer for float rounding
+            shares = self.balance * 0.999 / entry_price
         if not FRACTIONAL_SHARES:
             shares = int(shares)
         return round(shares, 6)
@@ -75,7 +105,6 @@ class PaperTrader:
     # ── Opening positions ───────────────────────────────────────
 
     def open_position(self, sig: Signal) -> Position | None:
-        # Skip pending (unconfirmed) signals
         if sig.pending:
             log.info("[PENDING] %s %s — awaiting confirmation candle",
                      sig.direction.upper(), sig.symbol)
@@ -85,7 +114,6 @@ class PaperTrader:
             log.info("[SKIP] Max open positions reached")
             return None
 
-        # No doubling up on same symbol + direction
         for p in self.positions:
             if p.status == "open" and p.symbol == sig.symbol and p.direction == sig.direction:
                 return None
@@ -100,6 +128,7 @@ class PaperTrader:
             return None
 
         self.balance -= cost
+        risk_pct = self._current_risk_pct()
 
         pos = Position(
             symbol=sig.symbol,
@@ -117,7 +146,7 @@ class PaperTrader:
         print(f"  NEW {sig.direction.upper()} — {sig.symbol}")
         print(f"  Entry: ${sig.entry_price:.2f}  |  Shares: {shares:.4f}")
         print(f"  SL: ${sig.stop_loss:.2f}  |  TP1: ${sig.take_profit_1:.2f}  |  TP2: ${sig.take_profit_2:.2f}")
-        print(f"  Risk:Reward = 1:{sig.risk_reward:.2f}")
+        print(f"  Risk:Reward = 1:{sig.risk_reward:.2f}  |  Risk: {risk_pct:.1f}%")
         print(f"  Time: {sig.signal_time}")
         print(f"{'='*60}\n")
         return pos
@@ -125,12 +154,12 @@ class PaperTrader:
     # ── Updating open positions ─────────────────────────────────
 
     def update_positions(self, current_bars: dict[str, dict]) -> None:
-        """Check SL / TP hits against latest bar data.
+        """Check SL / TP / trailing stop against latest bar data.
 
-        current_bars: {symbol: {"high": float, "low": float, "close": float, "time": datetime}}
+        current_bars: {symbol: {"high", "low", "close", "time", "atr"(optional)}}
         """
         for pos in self.positions:
-            if pos.status != "open":
+            if pos.status != "open" or pos.shares <= 0:
                 continue
             bar = current_bars.get(pos.symbol)
             if bar is None:
@@ -138,8 +167,23 @@ class PaperTrader:
 
             bar_high = bar["high"]
             bar_low = bar["low"]
-            bar_close = bar["close"]
             bar_time = bar["time"]
+            bar_atr = bar.get("atr", 0)
+
+            # ── Trailing stop update (after TP1) ────────────────
+            if pos.partial_tp_hit and TRAILING_STOP_ENABLED and bar_atr > 0:
+                if pos.direction == "long":
+                    if bar_high > pos.highest_since_tp1:
+                        pos.highest_since_tp1 = bar_high
+                    new_trail = pos.highest_since_tp1 - TRAILING_STOP_ATR_MULT * bar_atr
+                    if new_trail > pos.stop_loss:
+                        pos.stop_loss = new_trail
+                else:
+                    if bar_low < pos.lowest_since_tp1:
+                        pos.lowest_since_tp1 = bar_low
+                    new_trail = pos.lowest_since_tp1 + TRAILING_STOP_ATR_MULT * bar_atr
+                    if new_trail < pos.stop_loss:
+                        pos.stop_loss = new_trail
 
             # ── Stop loss ───────────────────────────────────────
             sl_hit = False
@@ -162,6 +206,11 @@ class PaperTrader:
 
                 if tp1_hit:
                     self._partial_close(pos, pos.take_profit_1, bar_time)
+                    # Initialize trailing stop tracking
+                    if pos.direction == "long":
+                        pos.highest_since_tp1 = bar_high
+                    else:
+                        pos.lowest_since_tp1 = bar_low
                     continue
 
             # ── Take profit 2 (full close) ─────────────────────
@@ -185,8 +234,6 @@ class PaperTrader:
         close_shares = pos.shares / 2.0
         pnl = self._calc_pnl(pos.direction, pos.entry_price, price, close_shares)
 
-        # At open we deducted: shares * entry_price
-        # Partial close returns: close_shares * entry_price + pnl
         returned = close_shares * pos.entry_price + pnl
         self.balance += returned
 
@@ -202,8 +249,9 @@ class PaperTrader:
             exit_reason="take_profit_1",
         ))
 
-        print(f"  [TP1 HIT] {pos.symbol} — closed {close_shares:.4f} shares @ ${price:.2f}"
-              f"  P&L: ${pnl:+.2f}  |  SL moved to breakeven")
+        print(f"  [TP1 HIT] {pos.symbol} — closed {close_shares:.4f} @ ${price:.2f}"
+              f"  P&L: ${pnl:+.2f}  |  SL → breakeven"
+              f"  |  {'Trailing ON' if TRAILING_STOP_ENABLED else ''}")
 
     def _close_position(self, pos: Position, price: float,
                         time: datetime, reason: str) -> None:
@@ -220,8 +268,8 @@ class PaperTrader:
             exit_reason=reason,
         ))
 
-        tag = "SL" if reason == "stop_loss" else "TP2"
-        print(f"  [{tag} HIT] {pos.symbol} — closed {pos.shares:.4f} shares @ ${price:.2f}"
+        tag = {"stop_loss": "SL", "take_profit_2": "TP2", "trailing_stop": "TRAIL"}.get(reason, reason)
+        print(f"  [{tag} HIT] {pos.symbol} — closed {pos.shares:.4f} @ ${price:.2f}"
               f"  P&L: ${pnl:+.2f}")
         pos.shares = 0.0
 
@@ -242,38 +290,43 @@ class PaperTrader:
 
         open_positions = [p for p in self.positions if p.status == "open" and p.shares > 0]
         u_pnl = self.unrealized_pnl(current_prices)
+        equity = self.balance + u_pnl
+        self.peak_equity = max(self.peak_equity, equity)
+        drawdown = (self.peak_equity - equity) / self.peak_equity * 100 if self.peak_equity > 0 else 0
+        growth = (equity - self.initial_balance) / self.initial_balance * 100
+        risk_pct = self._current_risk_pct()
 
         print(f"\n{'─'*60}")
         print(f"  PORTFOLIO STATUS")
-        print(f"  Cash Balance: ${self.balance:,.2f}")
-        print(f"  Unrealized P&L: ${u_pnl:+,.2f}")
-        print(f"  Equity: ${self.balance + u_pnl:,.2f}")
+        print(f"  Cash: ${self.balance:,.2f}  |  Equity: ${equity:,.2f}")
+        print(f"  Growth: {growth:+.1f}%  |  Drawdown: {drawdown:.1f}%")
+        print(f"  Risk Tier: {risk_pct:.1f}% per trade")
         print(f"  Open Positions: {len(open_positions)}")
 
         for p in open_positions:
             price = current_prices.get(p.symbol, p.entry_price)
             pnl = self._calc_pnl(p.direction, p.entry_price, price, p.shares)
+            trail_info = f" SL=${p.stop_loss:.2f}" if p.partial_tp_hit else ""
             print(f"    {p.direction.upper()} {p.symbol}: "
-                  f"{p.shares:.4f} shares @ ${p.entry_price:.2f} "
-                  f"| Current: ${price:.2f} | P&L: ${pnl:+.2f}"
-                  f"{' [TP1 hit]' if p.partial_tp_hit else ''}")
+                  f"{p.shares:.4f} @ ${p.entry_price:.2f} "
+                  f"→ ${price:.2f}  P&L: ${pnl:+.2f}"
+                  f"{' [TP1+trail]' if p.partial_tp_hit else ''}{trail_info}")
 
         if self.history:
             wins = [t for t in self.history if t.pnl > 0]
             losses = [t for t in self.history if t.pnl <= 0]
             total_pnl = sum(t.pnl for t in self.history)
-            win_rate = len(wins) / len(self.history) * 100 if self.history else 0
+            win_rate = len(wins) / len(self.history) * 100
             gross_profit = sum(t.pnl for t in wins) if wins else 0
             gross_loss = abs(sum(t.pnl for t in losses)) if losses else 0
             pf = gross_profit / gross_loss if gross_loss > 0 else float("inf")
 
-            print(f"\n  TRADE STATS")
-            print(f"  Total Trades: {len(self.history)}  |  Win Rate: {win_rate:.1f}%")
-            print(f"  Total P&L: ${total_pnl:+,.2f}")
-            print(f"  Profit Factor: {pf:.2f}")
+            print(f"\n  STATS: {len(self.history)} trades  |  WR: {win_rate:.0f}%"
+                  f"  |  PF: {pf:.2f}  |  P&L: ${total_pnl:+,.2f}")
             if wins:
-                print(f"  Largest Win: ${max(t.pnl for t in wins):+,.2f}")
+                print(f"  Best: ${max(t.pnl for t in wins):+,.2f}", end="")
             if losses:
-                print(f"  Largest Loss: ${min(t.pnl for t in losses):+,.2f}")
+                print(f"  |  Worst: ${min(t.pnl for t in losses):+,.2f}", end="")
+            print()
 
         print(f"{'─'*60}\n")

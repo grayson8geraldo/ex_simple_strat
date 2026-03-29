@@ -26,6 +26,7 @@ from config import (
     IMPULSE_MAX_RETRACE_RATIO,
     IMPULSE_MIN_ATR_MULTIPLE,
     IMPULSE_MIN_BARS,
+    MIN_RISK_REWARD,
     RETRACEMENT_ZONE_HIGH,
     RETRACEMENT_ZONE_LOW,
     SL_ATR_BUFFER,
@@ -240,18 +241,30 @@ def detect_tfc_entry(df: pd.DataFrame, fib: FibLevels,
             continue
 
         # ── Confluence filters ──────────────────────────────────
-        # Confirmation candle must close back in the trend direction.
-        # For longs: confirmation close > EMA (price reclaiming the average).
-        # For shorts: confirmation close < EMA.
-        # VWAP acts as secondary filter on the confirmation candle.
+        # Price naturally dips below EMA during retrace, so we use
+        # two softer checks:
+        # 1) EMA must be trending with the impulse (compare to impulse start)
+        # 2) Confirmation candle closes above signal candle (momentum shift)
 
         if ema_vals is not None:
-            if fib.direction == "bullish" and closes[i] < ema_vals[i]:
+            ema_at_impulse = ema_vals[fib.start_idx]
+            ema_now = ema_vals[i]
+            # EMA should have moved in impulse direction since start
+            if fib.direction == "bullish" and ema_now < ema_at_impulse:
                 signal_candle_idx = i if _candle_touches_zone(highs[i], lows[i], zone_low, zone_high) else None
                 continue
-            if fib.direction == "bearish" and closes[i] > ema_vals[i]:
+            if fib.direction == "bearish" and ema_now > ema_at_impulse:
                 signal_candle_idx = i if _candle_touches_zone(highs[i], lows[i], zone_low, zone_high) else None
                 continue
+
+        # Confirmation candle must close in the trend direction
+        sc = signal_candle_idx
+        if fib.direction == "bullish" and closes[i] < closes[sc]:
+            signal_candle_idx = i if _candle_touches_zone(highs[i], lows[i], zone_low, zone_high) else None
+            continue
+        if fib.direction == "bearish" and closes[i] > closes[sc]:
+            signal_candle_idx = i if _candle_touches_zone(highs[i], lows[i], zone_low, zone_high) else None
+            continue
 
         # ── Build signal ────────────────────────────────────────
         atr_now = atr_vals[i] if i < len(atr_vals) else atr_vals[-1]
@@ -305,7 +318,7 @@ def scan_for_signals(df: pd.DataFrame, symbol: str) -> list[Signal]:
     for imp in impulses:
         sig = detect_tfc_entry(df, imp, symbol)
         if sig is not None and sig.signal_candle_idx not in seen_bars:
-            if sig.risk_reward >= 1.0:  # Minimum 1:1 R:R
+            if sig.risk_reward >= MIN_RISK_REWARD:
                 signals.append(sig)
                 seen_bars.add(sig.signal_candle_idx)
 

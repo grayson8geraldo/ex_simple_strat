@@ -46,8 +46,9 @@ def print_banner(symbols: list[str], interval: str, period: str) -> None:
     print(f"  Timeframe:  {interval}")
     print(f"  Lookback:   {period}")
     print(f"  Balance:    ${config.INITIAL_BALANCE:,.2f}")
-    print(f"  Risk/Trade: {config.RISK_PER_TRADE_PCT}%")
+    print(f"  Risk/Trade: {config.RISK_PER_TRADE_PCT}% (scales with equity)")
     print(f"  Max Positions: {config.MAX_OPEN_POSITIONS}")
+    print(f"  Compounding: {'ON' if config.COMPOUND_ENABLED else 'OFF'}")
     print(f"  Fib Levels: {config.FIB_LEVELS}")
     print(f"  Entry Zone: {config.RETRACEMENT_ZONE_LOW}–{config.RETRACEMENT_ZONE_HIGH}")
     print()
@@ -77,11 +78,13 @@ def run_cycle(trader: PaperTrader, symbols: list[str],
 
         # Build latest bar info
         last = df.iloc[-1]
+        atr_col = f"atr_{config.ATR_PERIOD}"
         current_bars[sym] = {
             "high": last["high"],
             "low": last["low"],
             "close": last["close"],
             "time": df.index[-1],
+            "atr": last[atr_col] if atr_col in df.columns else 0,
         }
         current_prices[sym] = last["close"]
 

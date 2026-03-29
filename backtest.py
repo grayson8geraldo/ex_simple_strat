@@ -61,10 +61,12 @@ def walk_forward(df: pd.DataFrame, symbol: str, trader: PaperTrader,
 
         # Update positions with latest bar
         last = window.iloc[-1]
+        atr_col = f"atr_{config.ATR_PERIOD}"
         current_bars = {symbol: {
             "high": last["high"],
             "low": last["low"],
             "close": last["close"],
+            "atr": last[atr_col] if atr_col in window.columns else 0,
             "time": window.index[-1],
         }}
         trader.update_positions(current_bars)
