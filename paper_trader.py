@@ -270,6 +270,13 @@ class PaperTrader:
 
     # ── Reporting ───────────────────────────────────────────────
 
+    def _held_cost(self) -> float:
+        """Total cost basis of open positions (money locked in trades)."""
+        return sum(
+            p.shares * p.entry_price
+            for p in self.positions if p.status == "open" and p.shares > 0
+        )
+
     def unrealized_pnl(self, current_prices: dict[str, float]) -> float:
         total = 0.0
         for pos in self.positions:
@@ -285,7 +292,8 @@ class PaperTrader:
 
         open_positions = [p for p in self.positions if p.status == "open" and p.shares > 0]
         u_pnl = self.unrealized_pnl(current_prices)
-        equity = self.balance + u_pnl
+        # Equity = cash + money in positions + unrealized P&L
+        equity = self.balance + self._held_cost() + u_pnl
         self.peak_equity = max(self.peak_equity, equity)
         drawdown = (self.peak_equity - equity) / self.peak_equity * 100 if self.peak_equity > 0 else 0
         growth = (equity - self.initial_balance) / self.initial_balance * 100

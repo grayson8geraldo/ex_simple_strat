@@ -314,10 +314,16 @@ def scan_for_signals(df: pd.DataFrame, symbol: str) -> list[Signal]:
 
     signals = []
     seen_bars = set()
+    n = len(df)
+
+    # Only accept signals from the last 3 candles (fresh signals only)
+    min_signal_bar = n - 3
 
     for imp in impulses:
         sig = detect_tfc_entry(df, imp, symbol)
         if sig is not None and sig.signal_candle_idx not in seen_bars:
+            if sig.signal_candle_idx < min_signal_bar:
+                continue  # Stale signal — price has moved on
             if sig.risk_reward >= MIN_RISK_REWARD:
                 signals.append(sig)
                 seen_bars.add(sig.signal_candle_idx)

@@ -19,7 +19,7 @@ import logging
 import signal
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 
 import config
 from data_feed import fetch_all
@@ -55,11 +55,32 @@ def print_banner(symbols: list[str], interval: str, period: str) -> None:
     print()
 
 
+def _is_market_open() -> bool:
+    """Check if US stock market is likely open (rough check)."""
+    from datetime import timedelta
+    # US Eastern = UTC-4 (EDT) or UTC-5 (EST)
+    utc_now = datetime.now(timezone.utc)
+    et_now = utc_now - timedelta(hours=4)  # Approximate EDT
+    weekday = et_now.weekday()  # 0=Mon, 6=Sun
+    hour = et_now.hour
+    if weekday >= 5:  # Saturday/Sunday
+        return False
+    if hour < 9 or (hour == 9 and et_now.minute < 30):
+        return False
+    if hour >= 16:
+        return False
+    return True
+
+
 def run_cycle(trader: PaperTrader, symbols: list[str],
               interval: str, period: str) -> None:
     """One full scan cycle: fetch data → enrich → detect signals → trade."""
     now = datetime.now().strftime("%H:%M:%S")
-    print(f"\n[{now}] Scanning {', '.join(symbols)} ({interval})...")
+
+    if not _is_market_open():
+        print(f"\n[{now}] Market closed — scanning for status only (no new trades)")
+
+    print(f"[{now}] Scanning {', '.join(symbols)} ({interval})...")
 
     data = fetch_all(symbols, interval, period)
     if not data:
@@ -89,18 +110,19 @@ def run_cycle(trader: PaperTrader, symbols: list[str],
         }
         current_prices[sym] = last["close"]
 
-        # Scan for signals
-        signals = scan_for_signals(df, sym)
-        if signals:
-            log.info("Found %d signal(s) for %s", len(signals), sym)
-            all_signals.extend(signals)
-        else:
-            log.info("No signals for %s", sym)
+        # Scan for signals (only when market is open)
+        if _is_market_open():
+            signals = scan_for_signals(df, sym)
+            if signals:
+                log.info("Found %d signal(s) for %s", len(signals), sym)
+                all_signals.extend(signals)
+            else:
+                log.info("No signals for %s", sym)
 
-    # Update existing positions (SL/TP checks)
+    # Update existing positions (SL/TP checks) — always, even outside hours
     trader.update_positions(current_bars)
 
-    # Open new positions from signals
+    # Open new positions from fresh signals
     for sig in all_signals:
         trader.open_position(sig)
 
