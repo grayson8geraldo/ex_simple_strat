@@ -10,19 +10,19 @@ LOOKBACK_PERIOD = "30d"                   # History depth
 
 # ── Paper Account ───────────────────────────────────────────────
 INITIAL_BALANCE = 200.0                   # USD
-RISK_PER_TRADE_PCT = 3.0                  # Aggressive: 3% of balance per trade
+RISK_PER_TRADE_PCT = 10.0                 # Aggressive start: 10% of balance per trade
 MAX_OPEN_POSITIONS = 3                    # Allow 3 concurrent positions
 FRACTIONAL_SHARES = True                  # Allow fractional sizing
 
 # ── Compounding / Acceleration ──────────────────────────────────
-# Scale risk up as account grows (Kelly-lite approach)
+# Scale risk DOWN as account grows (protect gains)
 COMPOUND_ENABLED = True                   # Reinvest profits into sizing
 RISK_SCALE_TIERS = [                      # (equity_multiple, risk_pct)
-    (1.0, 3.0),                           # $200+  → 3% risk
-    (1.5, 4.0),                           # $300+  → 4% risk
-    (2.0, 5.0),                           # $400+  → 5% risk
-    (3.0, 4.0),                           # $600+  → back to 4% (protect gains)
-    (5.0, 3.0),                           # $1000+ → back to 3%
+    (1.0, 10.0),                          # $200+  → 10% risk (разгон)
+    (1.5, 8.0),                           # $300+  → 8%
+    (2.0, 6.0),                           # $400+  → 6%
+    (3.0, 4.0),                           # $600+  → 4%
+    (5.0, 3.0),                           # $1000+ → 3% (защита капитала)
 ]
 
 # ── Fibonacci Levels ────────────────────────────────────────────
