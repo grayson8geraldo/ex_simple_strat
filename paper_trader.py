@@ -1,0 +1,279 @@
+"""
+Paper trading engine — position management, sizing, P&L tracking.
+"""
+
+from __future__ import annotations
+
+import logging
+from dataclasses import dataclass, field
+from datetime import datetime
+
+from config import (
+    FRACTIONAL_SHARES,
+    INITIAL_BALANCE,
+    MAX_OPEN_POSITIONS,
+    RISK_PER_TRADE_PCT,
+)
+from strategy import Signal
+
+log = logging.getLogger(__name__)
+
+
+@dataclass
+class Position:
+    symbol: str
+    direction: str          # "long" or "short"
+    entry_price: float
+    shares: float
+    stop_loss: float
+    take_profit_1: float
+    take_profit_2: float
+    entry_time: datetime
+    status: str = "open"
+    partial_tp_hit: bool = False
+    original_shares: float = 0.0
+
+    def __post_init__(self):
+        if self.original_shares == 0.0:
+            self.original_shares = self.shares
+
+
+@dataclass
+class TradeRecord:
+    symbol: str
+    direction: str
+    entry_price: float
+    exit_price: float
+    shares: float
+    pnl: float
+    entry_time: datetime
+    exit_time: datetime
+    exit_reason: str
+
+
+class PaperTrader:
+    def __init__(self, initial_balance: float = INITIAL_BALANCE):
+        self.balance: float = initial_balance
+        self.positions: list[Position] = []
+        self.history: list[TradeRecord] = []
+
+    # ── Position sizing ─────────────────────────────────────────
+
+    def _calc_shares(self, entry_price: float, stop_loss: float) -> float:
+        risk_amount = self.balance * RISK_PER_TRADE_PCT / 100.0
+        risk_per_share = abs(entry_price - stop_loss)
+        if risk_per_share <= 0:
+            return 0.0
+        shares = risk_amount / risk_per_share
+        cost = shares * entry_price
+        if cost > self.balance:
+            shares = self.balance / entry_price
+        if not FRACTIONAL_SHARES:
+            shares = int(shares)
+        return round(shares, 6)
+
+    # ── Opening positions ───────────────────────────────────────
+
+    def open_position(self, sig: Signal) -> Position | None:
+        # Skip pending (unconfirmed) signals
+        if sig.pending:
+            log.info("[PENDING] %s %s — awaiting confirmation candle",
+                     sig.direction.upper(), sig.symbol)
+            return None
+
+        if len([p for p in self.positions if p.status == "open"]) >= MAX_OPEN_POSITIONS:
+            log.info("[SKIP] Max open positions reached")
+            return None
+
+        # No doubling up on same symbol + direction
+        for p in self.positions:
+            if p.status == "open" and p.symbol == sig.symbol and p.direction == sig.direction:
+                return None
+
+        shares = self._calc_shares(sig.entry_price, sig.stop_loss)
+        if shares <= 0:
+            log.info("[SKIP] Position size too small for %s", sig.symbol)
+            return None
+
+        cost = shares * sig.entry_price
+        if cost > self.balance:
+            return None
+
+        self.balance -= cost
+
+        pos = Position(
+            symbol=sig.symbol,
+            direction=sig.direction,
+            entry_price=sig.entry_price,
+            shares=shares,
+            stop_loss=sig.stop_loss,
+            take_profit_1=sig.take_profit_1,
+            take_profit_2=sig.take_profit_2,
+            entry_time=sig.signal_time,
+        )
+        self.positions.append(pos)
+
+        print(f"\n{'='*60}")
+        print(f"  NEW {sig.direction.upper()} — {sig.symbol}")
+        print(f"  Entry: ${sig.entry_price:.2f}  |  Shares: {shares:.4f}")
+        print(f"  SL: ${sig.stop_loss:.2f}  |  TP1: ${sig.take_profit_1:.2f}  |  TP2: ${sig.take_profit_2:.2f}")
+        print(f"  Risk:Reward = 1:{sig.risk_reward:.2f}")
+        print(f"  Time: {sig.signal_time}")
+        print(f"{'='*60}\n")
+        return pos
+
+    # ── Updating open positions ─────────────────────────────────
+
+    def update_positions(self, current_bars: dict[str, dict]) -> None:
+        """Check SL / TP hits against latest bar data.
+
+        current_bars: {symbol: {"high": float, "low": float, "close": float, "time": datetime}}
+        """
+        for pos in self.positions:
+            if pos.status != "open":
+                continue
+            bar = current_bars.get(pos.symbol)
+            if bar is None:
+                continue
+
+            bar_high = bar["high"]
+            bar_low = bar["low"]
+            bar_close = bar["close"]
+            bar_time = bar["time"]
+
+            # ── Stop loss ───────────────────────────────────────
+            sl_hit = False
+            if pos.direction == "long" and bar_low <= pos.stop_loss:
+                sl_hit = True
+            elif pos.direction == "short" and bar_high >= pos.stop_loss:
+                sl_hit = True
+
+            if sl_hit:
+                self._close_position(pos, pos.stop_loss, bar_time, "stop_loss")
+                continue
+
+            # ── Take profit 1 (partial close) ──────────────────
+            if not pos.partial_tp_hit:
+                tp1_hit = False
+                if pos.direction == "long" and bar_high >= pos.take_profit_1:
+                    tp1_hit = True
+                elif pos.direction == "short" and bar_low <= pos.take_profit_1:
+                    tp1_hit = True
+
+                if tp1_hit:
+                    self._partial_close(pos, pos.take_profit_1, bar_time)
+                    continue
+
+            # ── Take profit 2 (full close) ─────────────────────
+            if pos.partial_tp_hit:
+                tp2_hit = False
+                if pos.direction == "long" and bar_high >= pos.take_profit_2:
+                    tp2_hit = True
+                elif pos.direction == "short" and bar_low <= pos.take_profit_2:
+                    tp2_hit = True
+
+                if tp2_hit:
+                    self._close_position(pos, pos.take_profit_2, bar_time, "take_profit_2")
+
+    def _calc_pnl(self, direction: str, entry: float, exit_price: float, shares: float) -> float:
+        if direction == "long":
+            return (exit_price - entry) * shares
+        else:
+            return (entry - exit_price) * shares
+
+    def _partial_close(self, pos: Position, price: float, time: datetime) -> None:
+        close_shares = pos.shares / 2.0
+        pnl = self._calc_pnl(pos.direction, pos.entry_price, price, close_shares)
+
+        # At open we deducted: shares * entry_price
+        # Partial close returns: close_shares * entry_price + pnl
+        returned = close_shares * pos.entry_price + pnl
+        self.balance += returned
+
+        pos.shares -= close_shares
+        pos.partial_tp_hit = True
+        pos.stop_loss = pos.entry_price  # Move SL to breakeven
+
+        self.history.append(TradeRecord(
+            symbol=pos.symbol, direction=pos.direction,
+            entry_price=pos.entry_price, exit_price=price,
+            shares=close_shares, pnl=pnl,
+            entry_time=pos.entry_time, exit_time=time,
+            exit_reason="take_profit_1",
+        ))
+
+        print(f"  [TP1 HIT] {pos.symbol} — closed {close_shares:.4f} shares @ ${price:.2f}"
+              f"  P&L: ${pnl:+.2f}  |  SL moved to breakeven")
+
+    def _close_position(self, pos: Position, price: float,
+                        time: datetime, reason: str) -> None:
+        pnl = self._calc_pnl(pos.direction, pos.entry_price, price, pos.shares)
+        returned = pos.shares * pos.entry_price + pnl
+        self.balance += returned
+        pos.status = "closed"
+
+        self.history.append(TradeRecord(
+            symbol=pos.symbol, direction=pos.direction,
+            entry_price=pos.entry_price, exit_price=price,
+            shares=pos.shares, pnl=pnl,
+            entry_time=pos.entry_time, exit_time=time,
+            exit_reason=reason,
+        ))
+
+        tag = "SL" if reason == "stop_loss" else "TP2"
+        print(f"  [{tag} HIT] {pos.symbol} — closed {pos.shares:.4f} shares @ ${price:.2f}"
+              f"  P&L: ${pnl:+.2f}")
+        pos.shares = 0.0
+
+    # ── Reporting ───────────────────────────────────────────────
+
+    def unrealized_pnl(self, current_prices: dict[str, float]) -> float:
+        total = 0.0
+        for pos in self.positions:
+            if pos.status != "open" or pos.shares <= 0:
+                continue
+            price = current_prices.get(pos.symbol, pos.entry_price)
+            total += self._calc_pnl(pos.direction, pos.entry_price, price, pos.shares)
+        return total
+
+    def print_status(self, current_prices: dict[str, float] | None = None) -> None:
+        if current_prices is None:
+            current_prices = {}
+
+        open_positions = [p for p in self.positions if p.status == "open" and p.shares > 0]
+        u_pnl = self.unrealized_pnl(current_prices)
+
+        print(f"\n{'─'*60}")
+        print(f"  PORTFOLIO STATUS")
+        print(f"  Cash Balance: ${self.balance:,.2f}")
+        print(f"  Unrealized P&L: ${u_pnl:+,.2f}")
+        print(f"  Equity: ${self.balance + u_pnl:,.2f}")
+        print(f"  Open Positions: {len(open_positions)}")
+
+        for p in open_positions:
+            price = current_prices.get(p.symbol, p.entry_price)
+            pnl = self._calc_pnl(p.direction, p.entry_price, price, p.shares)
+            print(f"    {p.direction.upper()} {p.symbol}: "
+                  f"{p.shares:.4f} shares @ ${p.entry_price:.2f} "
+                  f"| Current: ${price:.2f} | P&L: ${pnl:+.2f}"
+                  f"{' [TP1 hit]' if p.partial_tp_hit else ''}")
+
+        if self.history:
+            wins = [t for t in self.history if t.pnl > 0]
+            losses = [t for t in self.history if t.pnl <= 0]
+            total_pnl = sum(t.pnl for t in self.history)
+            win_rate = len(wins) / len(self.history) * 100 if self.history else 0
+            gross_profit = sum(t.pnl for t in wins) if wins else 0
+            gross_loss = abs(sum(t.pnl for t in losses)) if losses else 0
+            pf = gross_profit / gross_loss if gross_loss > 0 else float("inf")
+
+            print(f"\n  TRADE STATS")
+            print(f"  Total Trades: {len(self.history)}  |  Win Rate: {win_rate:.1f}%")
+            print(f"  Total P&L: ${total_pnl:+,.2f}")
+            print(f"  Profit Factor: {pf:.2f}")
+            if wins:
+                print(f"  Largest Win: ${max(t.pnl for t in wins):+,.2f}")
+            if losses:
+                print(f"  Largest Loss: ${min(t.pnl for t in losses):+,.2f}")
+
+        print(f"{'─'*60}\n")
