@@ -43,6 +43,7 @@ EMA_PERIOD = 21
 # ── Risk Management ────────────────────────────────────────────
 SL_ATR_BUFFER = 0.3                       # Tighter SL → bigger position → faster growth
 MIN_RISK_REWARD = 0.8                     # Accept 0.8:1+ R:R (aggressive)
+MAX_POSITION_PCT = 40.0                   # Max 40% of balance per position
 TRAILING_STOP_ENABLED = True              # Trail SL after TP1 hit
 TRAILING_STOP_ATR_MULT = 1.5             # Trailing distance in ATR units
 

@@ -13,6 +13,7 @@ from config import (
     FRACTIONAL_SHARES,
     INITIAL_BALANCE,
     MAX_OPEN_POSITIONS,
+    MAX_POSITION_PCT,
     RISK_PER_TRADE_PCT,
     RISK_SCALE_TIERS,
     TRAILING_STOP_ATR_MULT,
@@ -95,9 +96,11 @@ class PaperTrader:
         if risk_per_share <= 0:
             return 0.0
         shares = risk_amount / risk_per_share
+        # Cap position cost at MAX_POSITION_PCT of balance
+        max_cost = self.balance * MAX_POSITION_PCT / 100.0
         cost = shares * entry_price
-        if cost > self.balance * 0.999:  # Leave tiny buffer for float rounding
-            shares = self.balance * 0.999 / entry_price
+        if cost > max_cost:
+            shares = max_cost / entry_price
         if not FRACTIONAL_SHARES:
             shares = int(shares)
         return round(shares, 6)
