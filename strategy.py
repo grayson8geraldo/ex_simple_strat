@@ -316,8 +316,8 @@ def scan_for_signals(df: pd.DataFrame, symbol: str) -> list[Signal]:
     seen_bars = set()
     n = len(df)
 
-    # Only accept signals from the last 3 candles (fresh signals only)
-    min_signal_bar = n - 3
+    # Only accept signals from the last 10 candles (fresh signals only)
+    min_signal_bar = n - 10
 
     for imp in impulses:
         sig = detect_tfc_entry(df, imp, symbol)

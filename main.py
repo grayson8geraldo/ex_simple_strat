@@ -76,9 +76,10 @@ def run_cycle(trader: PaperTrader, symbols: list[str],
               interval: str, period: str) -> None:
     """One full scan cycle: fetch data → enrich → detect signals → trade."""
     now = datetime.now().strftime("%H:%M:%S")
+    market_open = _is_market_open()
 
-    if not _is_market_open():
-        print(f"\n[{now}] Market closed — scanning for status only (no new trades)")
+    if not market_open:
+        print(f"\n[{now}] Market closed — signals shown but no new trades")
 
     print(f"[{now}] Scanning {', '.join(symbols)} ({interval})...")
 
@@ -110,21 +111,28 @@ def run_cycle(trader: PaperTrader, symbols: list[str],
         }
         current_prices[sym] = last["close"]
 
-        # Scan for signals (only when market is open)
-        if _is_market_open():
-            signals = scan_for_signals(df, sym)
-            if signals:
-                log.info("Found %d signal(s) for %s", len(signals), sym)
-                all_signals.extend(signals)
-            else:
-                log.info("No signals for %s", sym)
+        # Always scan for signals
+        signals = scan_for_signals(df, sym)
+        if signals:
+            log.info("Found %d signal(s) for %s", len(signals), sym)
+            all_signals.extend(signals)
+        else:
+            log.info("No signals for %s", sym)
 
     # Update existing positions (SL/TP checks) — always, even outside hours
     trader.update_positions(current_bars)
 
     # Open new positions from fresh signals
-    for sig in all_signals:
-        trader.open_position(sig)
+    if all_signals and not market_open:
+        print(f"\n  ** {len(all_signals)} signal(s) found — waiting for market open to execute **")
+        for sig in all_signals:
+            print(f"     {sig.direction.upper()} {sig.symbol} @ ${sig.entry_price:.2f}"
+                  f"  SL ${sig.stop_loss:.2f}  TP ${sig.take_profit_1:.2f}"
+                  f"  R:R 1:{sig.risk_reward:.1f}")
+
+    if market_open:
+        for sig in all_signals:
+            trader.open_position(sig)
 
     # Print portfolio status
     trader.print_status(current_prices)
