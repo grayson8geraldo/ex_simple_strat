@@ -19,7 +19,7 @@ import logging
 import signal
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import datetime
 
 import config
 from data_feed import fetch_all
@@ -55,33 +55,11 @@ def print_banner(symbols: list[str], interval: str, period: str) -> None:
     print()
 
 
-def _is_market_open() -> bool:
-    """Check if US stock market is likely open (rough check)."""
-    from datetime import timedelta
-    # US Eastern = UTC-4 (EDT) or UTC-5 (EST)
-    utc_now = datetime.now(timezone.utc)
-    et_now = utc_now - timedelta(hours=4)  # Approximate EDT
-    weekday = et_now.weekday()  # 0=Mon, 6=Sun
-    hour = et_now.hour
-    if weekday >= 5:  # Saturday/Sunday
-        return False
-    if hour < 9 or (hour == 9 and et_now.minute < 30):
-        return False
-    if hour >= 16:
-        return False
-    return True
-
-
 def run_cycle(trader: PaperTrader, symbols: list[str],
               interval: str, period: str) -> None:
     """One full scan cycle: fetch data → enrich → detect signals → trade."""
     now = datetime.now().strftime("%H:%M:%S")
-    market_open = _is_market_open()
-
-    if not market_open:
-        print(f"\n[{now}] Market closed — signals shown but no new trades")
-
-    print(f"[{now}] Scanning {', '.join(symbols)} ({interval})...")
+    print(f"\n[{now}] Scanning {', '.join(symbols)} ({interval})...")
 
     data = fetch_all(symbols, interval, period)
     if not data:
@@ -111,7 +89,7 @@ def run_cycle(trader: PaperTrader, symbols: list[str],
         }
         current_prices[sym] = last["close"]
 
-        # Always scan for signals
+        # Scan for signals
         signals = scan_for_signals(df, sym)
         if signals:
             log.info("Found %d signal(s) for %s", len(signals), sym)
@@ -119,20 +97,12 @@ def run_cycle(trader: PaperTrader, symbols: list[str],
         else:
             log.info("No signals for %s", sym)
 
-    # Update existing positions (SL/TP checks) — always, even outside hours
+    # Update existing positions (SL/TP checks)
     trader.update_positions(current_bars)
 
-    # Open new positions from fresh signals
-    if all_signals and not market_open:
-        print(f"\n  ** {len(all_signals)} signal(s) found — waiting for market open to execute **")
-        for sig in all_signals:
-            print(f"     {sig.direction.upper()} {sig.symbol} @ ${sig.entry_price:.2f}"
-                  f"  SL ${sig.stop_loss:.2f}  TP ${sig.take_profit_1:.2f}"
-                  f"  R:R 1:{sig.risk_reward:.1f}")
-
-    if market_open:
-        for sig in all_signals:
-            trader.open_position(sig)
+    # Open new positions
+    for sig in all_signals:
+        trader.open_position(sig)
 
     # Print portfolio status
     trader.print_status(current_prices)
